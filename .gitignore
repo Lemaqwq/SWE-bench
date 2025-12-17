@@ -170,3 +170,6 @@ cython_debug/
 data/repos/copies
 notebooks/
 *logs/
+
+*.json
+api/run_tag.py
