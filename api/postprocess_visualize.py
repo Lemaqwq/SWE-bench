@@ -3,15 +3,19 @@ import re
 import os
 import ast
 import argparse
+import sys
+from collections import Counter
 
-# Configuration for fixed fields
+# -------------------------------------------------------------------------
+# CONFIGURATION
+# -------------------------------------------------------------------------
 FIXED_METADATA = {
-    "task_source": "SWE-Bench-Verified",
-    "trajectory_source": "mini-swe-agent-1",
+    "task_source": "SWE-Smith",
+    "trajectory_source": "SWE-agent-LM-32B_train_5016_trajectories.json",
     "in_domain": "1",
     "agent_metadata": {
-        "producer": "Kimi-K2-Thinking",
-        "model_name": "moonshot/kimi-k2-thinking",
+        "producer": "",
+        "model_name": "",
     },
     "critic_agent_metadata": {
         "producer": "Claude-4.5-Sonnet",
@@ -19,31 +23,91 @@ FIXED_METADATA = {
     }
 }
 
+# -------------------------------------------------------------------------
+# VALIDATION LOGIC
+# -------------------------------------------------------------------------
+
+def parse_input_steps(content):
+    """
+    Scans the input content to find all unique step numbers.
+    Returns a set of integers representing the steps found.
+    """
+    if not content:
+        return set()
+    step_pattern = re.compile(r'<step_(\d+)>')
+    steps = set()
+    for match in step_pattern.finditer(content):
+        steps.add(int(match.group(1)))
+    return steps
+
+def validate_response_structure(llm_result, expected_steps):
+    """
+    Validates that the LLM result contains all expected steps,
+    and that each step has <thought> and <abilities> tags.
+    """
+    if not llm_result:
+        return False, "Empty or Null LLM Result"
+
+    missing_steps = []
+    malformed_steps = []
+
+    # If no steps were found in input (e.g. raw text), we assume at least step 1 is required
+    steps_to_check = sorted(expected_steps) if expected_steps else [1]
+
+    for step_num in steps_to_check:
+        step_regex = re.compile(
+            fr"<step_{step_num}>(.*?)</step_{step_num}>",
+            re.DOTALL | re.IGNORECASE
+        )
+        match = step_regex.search(llm_result)
+
+        if not match:
+            # Check if tag exists but unclosed or just missing
+            if f"<step_{step_num}>" not in llm_result:
+                missing_steps.append(step_num)
+            else:
+                malformed_steps.append(f"Step {step_num} unclosed tag")
+            continue
+
+        step_content = match.group(1)
+
+        has_thought = re.search(r"<thought>.*?</thought>", step_content, re.DOTALL | re.IGNORECASE)
+        has_abilities = re.search(r"<abilities>.*?</abilities>", step_content, re.DOTALL | re.IGNORECASE)
+
+        if not has_thought:
+            malformed_steps.append(f"Step {step_num} missing <thought>")
+        elif not has_abilities:
+            malformed_steps.append(f"Step {step_num} missing <abilities>")
+
+    if missing_steps:
+        return False, f"Missing steps: {missing_steps}"
+
+    if malformed_steps:
+        return False, f"Malformed steps: {', '.join(malformed_steps)}"
+
+    return True, "Valid"
+
+# -------------------------------------------------------------------------
+# PARSING & REFORMATTING LOGIC
+# -------------------------------------------------------------------------
+
 def parse_llm_xml(raw_text):
-    """
-    Parses the critic output (LLM result).
-    """
+    """Parses the critic output (LLM result)."""
     if not raw_text:
         return []
 
     parsed_steps = []
-    
-    # 1. Regex to find all step blocks: <step_1> ... </step_1>
     step_pattern = re.compile(r"<step_(\d+)>(.*?)</step_\1>", re.DOTALL)
-    
-    # Find all steps
     step_matches = step_pattern.findall(raw_text)
     
     for step_num, content in step_matches:
-        step_data = {
-            "step_number": int(step_num)
-        }
+        step_data = {"step_number": int(step_num)}
         
-        # 2. Extract <thought>
+        # Extract <thought>
         thought_match = re.search(r"<thought>(.*?)</thought>", content, re.DOTALL)
         step_data["thought"] = thought_match.group(1).strip() if thought_match else None
         
-        # 3. Extract <abilities>
+        # Extract <abilities>
         abilities_match = re.search(r"<(?:/)?abilities>(.*?)</abilities>", content, re.DOTALL)
         step_data["abilities"] = abilities_match.group(1).strip() if abilities_match else None
         
@@ -52,22 +116,16 @@ def parse_llm_xml(raw_text):
     return parsed_steps
 
 def parse_content_xml(raw_text):
-    """
-    Parses the 'content' field containing the interaction history.
-    """
+    """Parses the 'content' field containing the interaction history."""
     if not raw_text:
         return []
 
     parsed_steps = []
-    
-    # Regex to find <step_N> blocks
     step_pattern = re.compile(r"<step_(\d+)>(.*?)</step_\1>", re.DOTALL)
     step_matches = step_pattern.findall(raw_text)
 
     for step_num, content in step_matches:
-        step_data = {
-            "step_number": int(step_num)
-        }
+        step_data = {"step_number": int(step_num)}
 
         # Extract User Content (Observation)
         user_match = re.search(r"<user_content>(.*?)</user_content>", content, re.DOTALL)
@@ -89,17 +147,14 @@ def parse_assistant_response(raw_response):
     thought = ""
     action = ""
     
-    # Regex to find the function block
-    # Matches <function=...> ... </function> (DOTALL allows matching across newlines)
+    # Matches <function=...> ... </function>
     action_match = re.search(r"(<function=[\s\S]*?</function>)", raw_response)
     
     if action_match:
         action = action_match.group(1)
-        # Thought is everything before the function block
         thought_part = raw_response.split(action)[0]
         thought = thought_part.strip()
     else:
-        # If no function block found, assume it is entirely thought/reasoning
         thought = raw_response.strip()
         action = ""
 
@@ -109,135 +164,181 @@ def parse_assistant_response(raw_response):
         "agent_reasoning": thought 
     }
 
-def process_dataset(input_file_path, output_dir_path):
-    """
-    Reads the input JSONL and writes reformatted JSON files to the output directory.
-    """
-    # Create output directory if it doesn't exist
-    if not os.path.exists(output_dir_path):
-        try:
-            os.makedirs(output_dir_path)
-            print(f"Created output directory: {output_dir_path}")
-        except OSError as e:
-            print(f"Error creating directory {output_dir_path}: {e}")
-            return
+# -------------------------------------------------------------------------
+# MAIN WORKFLOW
+# -------------------------------------------------------------------------
 
+def process_dataset(input_file_path, output_dir_path, error_report_path=None):
     if not os.path.exists(input_file_path):
         print(f"Error: Input file '{input_file_path}' not found.")
         return
 
-    print(f"Processing {input_file_path}...")
+    print(f"1. Validating file: {input_file_path} ...\n")
     
-    count = 0
+    valid_data_lines = []
+    error_log = []
+    stats = {"total": 0, "valid": 0, "failed": 0}
+
+    # --- Step 1: Validation Pass ---
     with open(input_file_path, 'r', encoding='utf-8') as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
+
+            stats["total"] += 1
             
             try:
                 data = json.loads(line)
             except json.JSONDecodeError:
-                print(f"Skipping invalid JSON at line {line_num}")
+                stats["failed"] += 1
+                error_log.append({"line": line_num, "id": "unknown", "reason": "Invalid JSON line"})
                 continue
 
-            # 1. Extract IDs from input
-            trace_id = data.get("trace_id")
-            instance_id = data.get("instance_id", "unknown")
+            instance_id = data.get("instance_id", f"line_{line_num}")
+            content = data.get("content", "")
+            llm_result = data.get("llm_result")
+            llm_error = data.get("llm_error")
 
-            if not trace_id:
-                print(f"Skipping line {line_num}: missing trace_id")
-                continue
+            is_failed = False
+            fail_reason = ""
+
+            # Check 1: API Errors
+            if llm_error and str(llm_error).lower() not in ["null", "none", ""]:
+                is_failed = True
+                fail_reason = f"API Error: {str(llm_error)[:100]}..."
             
-            # 2. Parse Content (Trajectory)
-            content_steps = parse_content_xml(data.get("content", ""))
+            # Check 2: Empty Result
+            elif not llm_result:
+                is_failed = True
+                fail_reason = "Empty Result"
             
-            # 3. Parse LLM Result (Critics)
-            critic_steps = parse_llm_xml(data.get("llm_result", ""))
-            # Index critic steps by step_number for easy lookup
-            critic_map = {item['step_number']: item for item in critic_steps}
+            # Check 3: Structure (Steps match, tags exist)
+            else:
+                expected_steps = parse_input_steps(content)
+                is_valid, reason = validate_response_structure(llm_result, expected_steps)
+                if not is_valid:
+                    is_failed = True
+                    fail_reason = f"Structure Error: {reason}"
 
-            # 4. Construct Trajectory List
-            trajectory = []
-            instruction = ""
+            if is_failed:
+                stats["failed"] += 1
+                error_log.append({"id": instance_id, "reason": fail_reason})
+            else:
+                stats["valid"] += 1
+                valid_data_lines.append(data)
 
-            for i, step in enumerate(content_steps):
-                step_idx = step["step_number"]
-                
-                # Assume Step 1 user_content is the instruction
-                if step_idx == 1:
-                    instruction = step["observation"]
+    # --- Step 2: Print Report ---
+    print("-" * 50)
+    print("VALIDATION REPORT")
+    print("-" * 50)
+    print(f"Total Processed: {stats['total']}")
+    print(f"✅ Valid:         {stats['valid']}")
+    print(f"❌ Failed:        {stats['failed']}")
+    print("-" * 50)
 
-                # Parse internal thought/action using the function XML format
-                parsed_response = parse_assistant_response(step["raw_response"])
+    if error_log:
+        print("\n--- Top 5 Errors ---")
+        for err in error_log[:5]:
+            print(f"ID: {err['id']:<25} | {err['reason']}")
+        if len(error_log) > 5:
+            print(f"... and {len(error_log) - 5} more.")
+        
+        # Save full error report
+        if error_report_path:
+            os.makedirs(os.path.dirname(os.path.abspath(error_report_path)), exist_ok=True)
+            with open(error_report_path, "w", encoding="utf-8") as ef:
+                json.dump({"stats": stats, "errors": error_log}, ef, indent=2)
+            print(f"\nFull error report saved to: {error_report_path}")
 
-                # Get critic info for this step
-                critic_info = critic_map.get(step_idx, {})
-                critic_abilities = critic_info.get("abilities", "[]")
-                
-                # Convert string representation of list to actual list
-                try:
-                    if critic_abilities and critic_abilities.startswith("["):
-                         critic_abilities_list = ast.literal_eval(critic_abilities)
-                    else:
-                        critic_abilities_list = [critic_abilities] if critic_abilities else []
-                except:
-                    critic_abilities_list = [critic_abilities]
+    if stats["valid"] == 0:
+        print("\nNo valid traces found. Aborting reformat.")
+        return
 
-                trajectory_step = {
-                    "step_index": i, 
-                    "observation": step["observation"],
-                    "raw_response": step["raw_response"],
-                    "agent_reasoning": parsed_response["agent_reasoning"],
-                    "thought": parsed_response["thought"],
-                    "action": parsed_response["action"],
-                    "critics": {
-                        "abilities": critic_abilities_list,
-                        "critic_thought": critic_info.get("thought", "")
-                    }
+    # --- Step 3: Reformatting Pass ---
+    print(f"\n2. Reformatting {len(valid_data_lines)} valid traces to '{output_dir_path}'...")
+    
+    if not os.path.exists(output_dir_path):
+        os.makedirs(output_dir_path)
+
+    processed_count = 0
+    
+    for data in valid_data_lines:
+        trace_id = data.get("trace_id")
+        instance_id = data.get("instance_id")
+
+        if not trace_id:
+            print(f"Warning: Missing trace_id for instance {instance_id}. Skipping.")
+            continue
+
+        # Parse Content
+        content_steps = parse_content_xml(data.get("content", ""))
+        
+        # Parse Critics
+        critic_steps = parse_llm_xml(data.get("llm_result", ""))
+        critic_map = {item['step_number']: item for item in critic_steps}
+
+        trajectory = []
+        instruction = ""
+
+        for i, step in enumerate(content_steps):
+            step_idx = step["step_number"]
+            
+            if step_idx == 1:
+                instruction = step["observation"]
+
+            parsed_response = parse_assistant_response(step["raw_response"])
+            critic_info = critic_map.get(step_idx, {})
+            critic_abilities = critic_info.get("abilities", "[]")
+
+            try:
+                if critic_abilities and critic_abilities.startswith("["):
+                        critic_abilities_list = ast.literal_eval(critic_abilities)
+                else:
+                    critic_abilities_list = [critic_abilities] if critic_abilities else []
+            except:
+                critic_abilities_list = [critic_abilities]
+
+            trajectory_step = {
+                "step_index": i, 
+                "observation": step["observation"],
+                "raw_response": step["raw_response"],
+                "agent_reasoning": "",
+                "thought": parsed_response["thought"],
+                "action": parsed_response["action"],
+                "critics": {
+                    "abilities": critic_abilities_list,
+                    "critic_thought": critic_info.get("thought", "")
                 }
-                trajectory.append(trajectory_step)
-
-            # 5. Assemble Final Object
-            final_output = {
-                "trace_id": trace_id,
-                "task_id": instance_id,
-                **FIXED_METADATA,
-                "instruction": instruction,
-                "trajectory": trajectory,
-                "trajectory_length": len(trajectory)
             }
+            trajectory.append(trajectory_step)
 
-            # 6. Save to individual file
-            output_filename = f"{trace_id}.json"
-            output_path = os.path.join(output_dir_path, output_filename)
-            
-            with open(output_path, 'w', encoding='utf-8') as out_f:
-                json.dump(final_output, out_f, indent=2, ensure_ascii=False)
-            
-            count += 1
+        final_output = {
+            "trace_id": trace_id,
+            "task_id": instance_id,
+            **FIXED_METADATA,
+            "instruction": instruction,
+            "trajectory": trajectory,
+            "trajectory_length": len(trajectory)
+        }
 
-    print(f"Successfully processed {count} traces to '{output_dir_path}'.")
+        output_filename = f"{trace_id}.json"
+        output_path = os.path.join(output_dir_path, output_filename)
+        
+        with open(output_path, 'w', encoding='utf-8') as out_f:
+            json.dump(final_output, out_f, indent=2, ensure_ascii=False)
+        
+        processed_count += 1
+
+    print(f"Successfully reformatted {processed_count} files.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Reformat trajectory JSONL data into individual JSON files.")
+    parser = argparse.ArgumentParser(description="Validate and reformat trajectory JSONL data.")
     
-    # Input argument
-    parser.add_argument(
-        "--input", "-i", 
-        type=str, 
-        required=True, 
-        help="Path to the input .jsonl file"
-    )
-    
-    # Output argument
-    parser.add_argument(
-        "--output", "-o", 
-        type=str, 
-        required=True, 
-        help="Path to the output directory"
-    )
+    parser.add_argument("--input", "-i", type=str, required=True, help="Path to input .jsonl file")
+    parser.add_argument("--output", "-o", type=str, required=True, help="Path to output directory")
+    parser.add_argument("--error_report", "-e", type=str, default="validation_errors.json", help="Path to save error report")
 
     args = parser.parse_args()
     
-    process_dataset(args.input, args.output)
+    process_dataset(args.input, args.output, args.error_report)
