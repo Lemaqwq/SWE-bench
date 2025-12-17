@@ -2,16 +2,16 @@ import json
 import re
 import os
 import ast
+import argparse
 
 # Configuration for fixed fields
-OUTPUT_DIR = "reformatted_traces"
 FIXED_METADATA = {
     "task_source": "SWE-Bench-Verified",
     "trajectory_source": "mini-swe-agent-1",
     "in_domain": "1",
     "agent_metadata": {
-        "producer": "",
-        "model_name": "",
+        "producer": "Kimi-K2-Thinking",
+        "model_name": "moonshot/kimi-k2-thinking",
     },
     "critic_agent_metadata": {
         "producer": "Claude-4.5-Sonnet",
@@ -109,13 +109,28 @@ def parse_assistant_response(raw_response):
         "agent_reasoning": thought 
     }
 
-def process_file(input_file_path):
-    # Create output directory
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
+def process_dataset(input_file_path, output_dir_path):
+    """
+    Reads the input JSONL and writes reformatted JSON files to the output directory.
+    """
+    # Create output directory if it doesn't exist
+    if not os.path.exists(output_dir_path):
+        try:
+            os.makedirs(output_dir_path)
+            print(f"Created output directory: {output_dir_path}")
+        except OSError as e:
+            print(f"Error creating directory {output_dir_path}: {e}")
+            return
 
+    if not os.path.exists(input_file_path):
+        print(f"Error: Input file '{input_file_path}' not found.")
+        return
+
+    print(f"Processing {input_file_path}...")
+    
+    count = 0
     with open(input_file_path, 'r', encoding='utf-8') as f:
-        for line in f:
+        for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
@@ -123,7 +138,7 @@ def process_file(input_file_path):
             try:
                 data = json.loads(line)
             except json.JSONDecodeError:
-                print("Skipping invalid JSON line")
+                print(f"Skipping invalid JSON at line {line_num}")
                 continue
 
             # 1. Extract IDs from input
@@ -131,7 +146,7 @@ def process_file(input_file_path):
             instance_id = data.get("instance_id", "unknown")
 
             if not trace_id:
-                print(f"Skipping line with missing trace_id for instance {instance_id}")
+                print(f"Skipping line {line_num}: missing trace_id")
                 continue
             
             # 2. Parse Content (Trajectory)
@@ -153,7 +168,7 @@ def process_file(input_file_path):
                 if step_idx == 1:
                     instruction = step["observation"]
 
-                # Parse internal thought/action using the new XML format logic
+                # Parse internal thought/action using the function XML format
                 parsed_response = parse_assistant_response(step["raw_response"])
 
                 # Get critic info for this step
@@ -173,7 +188,7 @@ def process_file(input_file_path):
                     "step_index": i, 
                     "observation": step["observation"],
                     "raw_response": step["raw_response"],
-                    "agent_reasoning": "",
+                    "agent_reasoning": parsed_response["agent_reasoning"],
                     "thought": parsed_response["thought"],
                     "action": parsed_response["action"],
                     "critics": {
@@ -195,18 +210,34 @@ def process_file(input_file_path):
 
             # 6. Save to individual file
             output_filename = f"{trace_id}.json"
-            output_path = os.path.join(OUTPUT_DIR, output_filename)
+            output_path = os.path.join(output_dir_path, output_filename)
             
             with open(output_path, 'w', encoding='utf-8') as out_f:
                 json.dump(final_output, out_f, indent=2, ensure_ascii=False)
             
-            print(f"Processed trace {trace_id} -> {output_path}")
+            count += 1
+
+    print(f"Successfully processed {count} traces to '{output_dir_path}'.")
 
 if __name__ == "__main__":
-    # Replace with your actual input file name
-    INPUT_FILE = "output/20251215_011614__SWE-agent-LM-32B_train_5016_trajectories_reformat_part_1/20251215_011614__SWE-agent-LM-32B_train_5016_trajectories_reformat_part_1_results.jsonl" 
+    parser = argparse.ArgumentParser(description="Reformat trajectory JSONL data into individual JSON files.")
     
-    if os.path.exists(INPUT_FILE):
-        process_file(INPUT_FILE)
-    else:
-        print(f"File {INPUT_FILE} not found. Please ensure the jsonl file exists.")
+    # Input argument
+    parser.add_argument(
+        "--input", "-i", 
+        type=str, 
+        required=True, 
+        help="Path to the input .jsonl file"
+    )
+    
+    # Output argument
+    parser.add_argument(
+        "--output", "-o", 
+        type=str, 
+        required=True, 
+        help="Path to the output directory"
+    )
+
+    args = parser.parse_args()
+    
+    process_dataset(args.input, args.output)
