@@ -5,6 +5,7 @@ import ast
 import argparse
 import sys
 from collections import Counter
+from pathlib import Path
 
 # -------------------------------------------------------------------------
 # CONFIGURATION
@@ -30,7 +31,6 @@ FIXED_METADATA = {
 def parse_input_steps(content):
     """
     Scans the input content to find all unique step numbers.
-    Returns a set of integers representing the steps found.
     """
     if not content:
         return set()
@@ -62,7 +62,6 @@ def validate_response_structure(llm_result, expected_steps):
         match = step_regex.search(llm_result)
 
         if not match:
-            # Check if tag exists but unclosed or just missing
             if f"<step_{step_num}>" not in llm_result:
                 missing_steps.append(step_num)
             else:
@@ -92,7 +91,6 @@ def validate_response_structure(llm_result, expected_steps):
 # -------------------------------------------------------------------------
 
 def parse_llm_xml(raw_text):
-    """Parses the critic output (LLM result)."""
     if not raw_text:
         return []
 
@@ -103,11 +101,9 @@ def parse_llm_xml(raw_text):
     for step_num, content in step_matches:
         step_data = {"step_number": int(step_num)}
         
-        # Extract <thought>
         thought_match = re.search(r"<thought>(.*?)</thought>", content, re.DOTALL)
         step_data["thought"] = thought_match.group(1).strip() if thought_match else None
         
-        # Extract <abilities>
         abilities_match = re.search(r"<(?:/)?abilities>(.*?)</abilities>", content, re.DOTALL)
         step_data["abilities"] = abilities_match.group(1).strip() if abilities_match else None
         
@@ -116,7 +112,6 @@ def parse_llm_xml(raw_text):
     return parsed_steps
 
 def parse_content_xml(raw_text):
-    """Parses the 'content' field containing the interaction history."""
     if not raw_text:
         return []
 
@@ -127,11 +122,9 @@ def parse_content_xml(raw_text):
     for step_num, content in step_matches:
         step_data = {"step_number": int(step_num)}
 
-        # Extract User Content (Observation)
         user_match = re.search(r"<user_content>(.*?)</user_content>", content, re.DOTALL)
         step_data["observation"] = user_match.group(1).strip() if user_match else ""
 
-        # Extract Assistant Contents (Raw Response)
         assist_match = re.search(r"<assistant_contents>(.*?)</assistant_contents>", content, re.DOTALL)
         step_data["raw_response"] = assist_match.group(1).strip() if assist_match else ""
 
@@ -140,10 +133,6 @@ def parse_content_xml(raw_text):
     return parsed_steps
 
 def parse_assistant_response(raw_response):
-    """
-    Splits raw response into thought and action.
-    Format: Thought text followed by <function=name>...</function>
-    """
     thought = ""
     action = ""
     
@@ -168,14 +157,38 @@ def parse_assistant_response(raw_response):
 # MAIN WORKFLOW
 # -------------------------------------------------------------------------
 
-def process_dataset(input_file_path, output_dir_path, error_report_path=None):
+def setup_output_directories(input_file_path, base_output_root="format_output"):
+    """
+    Creates the directory structure based on input filename.
+    """
+    # extract filename without extension (e.g., 'data/run1.jsonl' -> 'run1')
+    input_stem = Path(input_file_path).stem
+    
+    # Define paths
+    run_dir = os.path.join(base_output_root, input_stem)
+    verified_dir = os.path.join(run_dir, "verified_output")
+    error_report_path = os.path.join(run_dir, "error_report.json")
+    retry_file_path = os.path.join(run_dir, "retry.jsonl")
+    
+    # Create directories
+    if not os.path.exists(verified_dir):
+        os.makedirs(verified_dir)
+        print(f"Created directory: {verified_dir}")
+        
+    return verified_dir, error_report_path, retry_file_path
+
+def process_dataset(input_file_path):
     if not os.path.exists(input_file_path):
         print(f"Error: Input file '{input_file_path}' not found.")
         return
 
+    # Setup directories
+    verified_dir, error_report_path, retry_file_path = setup_output_directories(input_file_path)
+
     print(f"1. Validating file: {input_file_path} ...\n")
     
     valid_data_lines = []
+    failed_data_lines = [] 
     error_log = []
     stats = {"total": 0, "valid": 0, "failed": 0}
 
@@ -192,10 +205,16 @@ def process_dataset(input_file_path, output_dir_path, error_report_path=None):
                 data = json.loads(line)
             except json.JSONDecodeError:
                 stats["failed"] += 1
-                error_log.append({"line": line_num, "id": "unknown", "reason": "Invalid JSON line"})
+                error_log.append({
+                    "line": line_num, 
+                    "trace_id": "unknown",
+                    "instance_id": "unknown", 
+                    "reason": "Invalid JSON syntax"
+                })
                 continue
 
             instance_id = data.get("instance_id", f"line_{line_num}")
+            trace_id = data.get("trace_id", f"unknown_trace_{line_num}")
             content = data.get("content", "")
             llm_result = data.get("llm_result")
             llm_error = data.get("llm_error")
@@ -213,7 +232,7 @@ def process_dataset(input_file_path, output_dir_path, error_report_path=None):
                 is_failed = True
                 fail_reason = "Empty Result"
             
-            # Check 3: Structure (Steps match, tags exist)
+            # Check 3: Structure
             else:
                 expected_steps = parse_input_steps(content)
                 is_valid, reason = validate_response_structure(llm_result, expected_steps)
@@ -223,12 +242,18 @@ def process_dataset(input_file_path, output_dir_path, error_report_path=None):
 
             if is_failed:
                 stats["failed"] += 1
-                error_log.append({"id": instance_id, "reason": fail_reason})
+                error_log.append({
+                    "line": line_num,
+                    "trace_id": trace_id,
+                    "instance_id": instance_id,
+                    "reason": fail_reason
+                })
+                failed_data_lines.append(data)
             else:
                 stats["valid"] += 1
                 valid_data_lines.append(data)
 
-    # --- Step 2: Print Report ---
+    # --- Step 2: Reporting & Retry Generation ---
     print("-" * 50)
     print("VALIDATION REPORT")
     print("-" * 50)
@@ -237,30 +262,31 @@ def process_dataset(input_file_path, output_dir_path, error_report_path=None):
     print(f"❌ Failed:        {stats['failed']}")
     print("-" * 50)
 
+    # Save Error Report
     if error_log:
-        print("\n--- Top 5 Errors ---")
-        for err in error_log[:5]:
-            print(f"ID: {err['id']:<25} | {err['reason']}")
-        if len(error_log) > 5:
-            print(f"... and {len(error_log) - 5} more.")
-        
-        # Save full error report
-        if error_report_path:
-            os.makedirs(os.path.dirname(os.path.abspath(error_report_path)), exist_ok=True)
-            with open(error_report_path, "w", encoding="utf-8") as ef:
-                json.dump({"stats": stats, "errors": error_log}, ef, indent=2)
-            print(f"\nFull error report saved to: {error_report_path}")
+        with open(error_report_path, "w", encoding="utf-8") as ef:
+            json.dump({"stats": stats, "errors": error_log}, ef, indent=2)
+        print(f"Full error report saved to: {error_report_path}")
+
+    # Save Retry File
+    if failed_data_lines:
+        with open(retry_file_path, "w", encoding="utf-8") as rf:
+            for item in failed_data_lines:
+                json.dump(item, rf, ensure_ascii=False)
+                rf.write("\n")
+        print(f"Retry file ({len(failed_data_lines)} instances) saved to: {retry_file_path}")
+    else:
+        # If no failures, maybe remove old retry file if exists?
+        if os.path.exists(retry_file_path):
+            os.remove(retry_file_path)
 
     if stats["valid"] == 0:
         print("\nNo valid traces found. Aborting reformat.")
         return
 
     # --- Step 3: Reformatting Pass ---
-    print(f"\n2. Reformatting {len(valid_data_lines)} valid traces to '{output_dir_path}'...")
+    print(f"\n2. Reformatting {len(valid_data_lines)} valid traces to '{verified_dir}'...")
     
-    if not os.path.exists(output_dir_path):
-        os.makedirs(output_dir_path)
-
     processed_count = 0
     
     for data in valid_data_lines:
@@ -303,7 +329,7 @@ def process_dataset(input_file_path, output_dir_path, error_report_path=None):
                 "step_index": i, 
                 "observation": step["observation"],
                 "raw_response": step["raw_response"],
-                "agent_reasoning": "",
+                "agent_reasoning": parsed_response["agent_reasoning"],
                 "thought": parsed_response["thought"],
                 "action": parsed_response["action"],
                 "critics": {
@@ -323,7 +349,7 @@ def process_dataset(input_file_path, output_dir_path, error_report_path=None):
         }
 
         output_filename = f"{trace_id}.json"
-        output_path = os.path.join(output_dir_path, output_filename)
+        output_path = os.path.join(verified_dir, output_filename)
         
         with open(output_path, 'w', encoding='utf-8') as out_f:
             json.dump(final_output, out_f, indent=2, ensure_ascii=False)
@@ -336,9 +362,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Validate and reformat trajectory JSONL data.")
     
     parser.add_argument("--input", "-i", type=str, required=True, help="Path to input .jsonl file")
-    parser.add_argument("--output", "-o", type=str, required=True, help="Path to output directory")
-    parser.add_argument("--error_report", "-e", type=str, default="validation_errors.json", help="Path to save error report")
-
+    
     args = parser.parse_args()
     
-    process_dataset(args.input, args.output, args.error_report)
+    process_dataset(args.input)
